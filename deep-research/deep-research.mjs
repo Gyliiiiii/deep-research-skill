@@ -6,10 +6,11 @@
  * Runs the Gemini Interactions API with the deep-research agent and streams
  * research progress to stderr, final Markdown report to stdout.
  *
- * The script is distribution-friendly:
- * - Prefers GEMINI_API_KEY from the environment
- * - Falls back to common OpenClaw config locations when available
- * - Tries multiple SDK resolution strategies instead of a developer-specific path
+ * Distribution rules:
+ * - Requires GEMINI_API_KEY from the environment
+ * - Uses @google/genai from npm by default
+ * - Optionally accepts an explicit GOOGLE_GENAI_SDK_PATH override
+ * - Does NOT auto-read local OpenClaw config files
  *
  * Usage:
  *   node deep-research.mjs "research topic"
@@ -20,32 +21,12 @@
  * Exit codes: 0 = success, 1 = arg error, 2 = setup/API error, 3 = timeout
  */
 
-import fs from 'node:fs/promises';
-import os from 'node:os';
-import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import path from 'node:path';
 
 // ─── SDK resolution ────────────────────────────────────────────────────────
 async function loadGoogleGenAI() {
-  const openclawHome =
-    process.env.OPENCLAW_HOME?.trim() || path.join(os.homedir(), '.openclaw');
-
-  const candidates = [
-    process.env.GOOGLE_GENAI_SDK_PATH?.trim(),
-    '@google/genai',
-    path.join(
-      openclawHome,
-      'extensions',
-      'mqtt',
-      'node_modules',
-      '@google',
-      'genai',
-      'dist',
-      'node',
-      'index.mjs',
-    ),
-  ].filter(Boolean);
-
+  const candidates = [process.env.GOOGLE_GENAI_SDK_PATH?.trim(), '@google/genai'].filter(Boolean);
   const errors = [];
 
   for (const candidate of candidates) {
@@ -65,7 +46,7 @@ async function loadGoogleGenAI() {
   }
 
   throw new Error(
-    `Unable to load @google/genai. Tried: ${candidates.join(', ')}${
+    `Unable to load @google/genai. Install it from npm, or set GOOGLE_GENAI_SDK_PATH explicitly. Tried: ${candidates.join(', ')}${
       errors.length ? `\n${errors.join('\n')}` : ''
     }`,
   );
@@ -122,9 +103,7 @@ Options:
   --help                        Show this help
 
 Environment:
-  GEMINI_API_KEY                Preferred API key source
-  OPENCLAW_CONFIG_PATH          Optional explicit OpenClaw config path
-  OPENCLAW_HOME                 Optional OpenClaw home (default: ~/.openclaw)
+  GEMINI_API_KEY                Required Gemini API key
   GOOGLE_GENAI_SDK_PATH         Optional explicit @google/genai SDK path
 
 Exit codes:
@@ -141,43 +120,11 @@ if (!query) {
   process.exit(1);
 }
 
-// ─── API key resolution ────────────────────────────────────────────────────
-async function resolveApiKey() {
-  if (process.env.GEMINI_API_KEY?.trim()) {
-    return process.env.GEMINI_API_KEY.trim();
-  }
-
-  const openclawHome =
-    process.env.OPENCLAW_HOME?.trim() || path.join(os.homedir(), '.openclaw');
-  const candidates = [
-    process.env.OPENCLAW_CONFIG_PATH?.trim(),
-    path.join(openclawHome, 'openclaw.json'),
-  ].filter(Boolean);
-
-  for (const candidate of candidates) {
-    try {
-      const raw = await fs.readFile(candidate, 'utf8');
-      const config = JSON.parse(raw);
-      const key =
-        config?.skills?.entries?.['nano-banana-pro']?.apiKey ||
-        config?.agents?.defaults?.memorySearch?.remote?.apiKey;
-      if (typeof key === 'string' && key.trim()) {
-        return key.trim();
-      }
-    } catch {
-      // Ignore missing/unreadable/non-JSON configs and keep trying.
-    }
-  }
-
-  throw new Error(
-    'GEMINI_API_KEY is required. Set it directly, or make it available in your OpenClaw config.',
-  );
-}
-
-const apiKey = await resolveApiKey().catch((err) => {
-  console.error(`Error: ${err.message}`);
+const apiKey = process.env.GEMINI_API_KEY?.trim();
+if (!apiKey) {
+  console.error('Error: GEMINI_API_KEY environment variable is required.');
   process.exit(2);
-});
+}
 
 // ─── Initialize ─────────────────────────────────────────────────────────────
 const client = new GoogleGenAI({ apiKey });
