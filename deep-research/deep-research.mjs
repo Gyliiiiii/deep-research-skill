@@ -1,10 +1,15 @@
 #!/usr/bin/env node
 
 /**
- * deep-research.mjs — Gemini Deep Research Agent helper script
+ * deep-research.mjs — Gemini Deep Research helper script
  *
- * Calls the Gemini Interactions API with the deep-research-pro-preview agent.
- * Streams research progress to stderr, final Markdown report to stdout.
+ * Runs the Gemini Interactions API with the deep-research agent and streams
+ * research progress to stderr, final Markdown report to stdout.
+ *
+ * The script is distribution-friendly:
+ * - Prefers GEMINI_API_KEY from the environment
+ * - Falls back to common OpenClaw config locations when available
+ * - Tries multiple SDK resolution strategies instead of a developer-specific path
  *
  * Usage:
  *   node deep-research.mjs "research topic"
@@ -12,14 +17,61 @@
  *   node deep-research.mjs --follow-up <interaction_id> "follow-up question"
  *   node deep-research.mjs "research topic" --no-stream
  *
- * Exit codes: 0 = success, 1 = arg error, 2 = API error, 3 = timeout
+ * Exit codes: 0 = success, 1 = arg error, 2 = setup/API error, 3 = timeout
  */
 
-// ─── SDK import (bundled with OpenClaw) ─────────────────────────────────────
-const SDK_PATH =
-  '/Users/feifei/.openclaw/extensions/mqtt/node_modules/@google/genai/dist/node/index.mjs';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 
-const { GoogleGenAI } = await import(SDK_PATH);
+// ─── SDK resolution ────────────────────────────────────────────────────────
+async function loadGoogleGenAI() {
+  const openclawHome =
+    process.env.OPENCLAW_HOME?.trim() || path.join(os.homedir(), '.openclaw');
+
+  const candidates = [
+    process.env.GOOGLE_GENAI_SDK_PATH?.trim(),
+    '@google/genai',
+    path.join(
+      openclawHome,
+      'extensions',
+      'mqtt',
+      'node_modules',
+      '@google',
+      'genai',
+      'dist',
+      'node',
+      'index.mjs',
+    ),
+  ].filter(Boolean);
+
+  const errors = [];
+
+  for (const candidate of candidates) {
+    try {
+      const specifier =
+        candidate.startsWith('/') || candidate.startsWith('.')
+          ? pathToFileURL(path.resolve(candidate)).href
+          : candidate;
+      const mod = await import(specifier);
+      if (mod?.GoogleGenAI) {
+        return mod.GoogleGenAI;
+      }
+      errors.push(`${candidate}: GoogleGenAI export not found`);
+    } catch (err) {
+      errors.push(`${candidate}: ${err.message}`);
+    }
+  }
+
+  throw new Error(
+    `Unable to load @google/genai. Tried: ${candidates.join(', ')}${
+      errors.length ? `\n${errors.join('\n')}` : ''
+    }`,
+  );
+}
+
+const GoogleGenAI = await loadGoogleGenAI();
 
 // ─── Argument parsing ───────────────────────────────────────────────────────
 const argv = process.argv.slice(2);
@@ -69,10 +121,16 @@ Options:
   --no-stream                   Use polling instead of streaming
   --help                        Show this help
 
+Environment:
+  GEMINI_API_KEY                Preferred API key source
+  OPENCLAW_CONFIG_PATH          Optional explicit OpenClaw config path
+  OPENCLAW_HOME                 Optional OpenClaw home (default: ~/.openclaw)
+  GOOGLE_GENAI_SDK_PATH         Optional explicit @google/genai SDK path
+
 Exit codes:
   0  Success
   1  Argument error
-  2  API error
+  2  Setup or API error
   3  Timeout`,
   );
 }
@@ -83,11 +141,43 @@ if (!query) {
   process.exit(1);
 }
 
-const apiKey = process.env.GEMINI_API_KEY;
-if (!apiKey) {
-  console.error('Error: GEMINI_API_KEY environment variable is required.');
-  process.exit(2);
+// ─── API key resolution ────────────────────────────────────────────────────
+async function resolveApiKey() {
+  if (process.env.GEMINI_API_KEY?.trim()) {
+    return process.env.GEMINI_API_KEY.trim();
+  }
+
+  const openclawHome =
+    process.env.OPENCLAW_HOME?.trim() || path.join(os.homedir(), '.openclaw');
+  const candidates = [
+    process.env.OPENCLAW_CONFIG_PATH?.trim(),
+    path.join(openclawHome, 'openclaw.json'),
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    try {
+      const raw = await fs.readFile(candidate, 'utf8');
+      const config = JSON.parse(raw);
+      const key =
+        config?.skills?.entries?.['nano-banana-pro']?.apiKey ||
+        config?.agents?.defaults?.memorySearch?.remote?.apiKey;
+      if (typeof key === 'string' && key.trim()) {
+        return key.trim();
+      }
+    } catch {
+      // Ignore missing/unreadable/non-JSON configs and keep trying.
+    }
+  }
+
+  throw new Error(
+    'GEMINI_API_KEY is required. Set it directly, or make it available in your OpenClaw config.',
+  );
 }
+
+const apiKey = await resolveApiKey().catch((err) => {
+  console.error(`Error: ${err.message}`);
+  process.exit(2);
+});
 
 // ─── Initialize ─────────────────────────────────────────────────────────────
 const client = new GoogleGenAI({ apiKey });
@@ -178,7 +268,6 @@ function handleDelta(event) {
   if (delta.type === 'text') {
     process.stdout.write(delta.text || '');
   } else if (delta.type === 'thought_summary') {
-    // Thought summaries contain interim thinking — show on stderr
     const text = delta.content?.text || '';
     if (text) {
       console.error(`💭 ${text}`);
@@ -195,12 +284,11 @@ async function runPolling(params) {
   const id = interaction.id;
   console.error(`📊 Research created (ID: ${id})`);
 
-  const POLL_INTERVAL = 15_000; // 15 seconds
+  const POLL_INTERVAL = 15_000;
 
   while (true) {
     await sleep(POLL_INTERVAL);
 
-    // Poll with streaming to get the full content once complete
     const updated = await client.interactions.get(id);
     const status = updated.status;
     const elapsed = formatElapsed(Date.now() - startTime);
